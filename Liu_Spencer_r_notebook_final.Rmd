@@ -1,0 +1,800 @@
+---
+title: "Liu Spencer et al. 2023 R Notebook"
+output: html_notebook
+---
+
+All code written in R used for Liu Spencer et al. "Persistent enrichment of multidrug resistant Klebsiella in oral and nasal communities during long-term starvation" (2023)
+
+```{r, results="hide"}
+library(Biostrings)
+library(DECIPHER)
+library(phyloseq)
+library(ggplot2)
+library(gridExtra)
+library(dada2)
+library(stringi)
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(metacoder)
+library(vegan)
+library(agricolae)
+library(svglite)
+
+```
+
+```{r}
+#set working directory
+working_dir <- "/home/ubuntu/data/Projects/Nell_Saliva_Nares/publication_run/"
+```
+
+Folder titled "required_files" in the "r_notebook_required_files" directory (available on Zenodo: "10.5281/zenodo.10403630") should be placed in the working directory.
+
+```{r}
+#set output folder
+output_folder = "/home/ubuntu/data/Projects/Nell_Saliva_Nares/publication_run/output/"
+```
+
+## create Decipher database using eHOMD
+
+```{r}
+#create taxid file for decipher
+ranks <- readLines(paste0(working_dir, "required_files/HOMD_16S_rRNA_RefSeq_V15.23.qiime.taxonomy.decipher"))
+taxa <- setNames(c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+                    c("k__", "p__", "c__","o__", "f__", "g__", "s__"))
+ranks <- strsplit(ranks, ";", fix=T)
+count <- 1L
+groups <- "Root"
+index <- -1L
+level <- 0L
+rank <- "rootrank"
+pBar <- txtProgressBar(style=3)
+for (i in seq_along(ranks)) {
+            for (j in seq_along(ranks[[i]])) {
+                    rank_level <- taxa[substring(ranks[[i]][j], 1, 3)]
+                    group <- substring(ranks[[i]][j], 4)
+                    w <- which(groups==group & rank==rank_level)
+                    if (length(w) > 0) {
+                      parent <- match(substring(ranks[[i]][j - 1], 4),
+                              groups)
+                      if (j==1 || any((parent - 1L)==index[w]))
+                              next # already included
+                    }
+                    count <- count + 1L
+                    groups <- c(groups, group)
+                    if (j==1) {
+                      index <- c(index, 0)
+                    } else {
+                      parent <- match(substring(ranks[[i]][j - 1], 4),groups)
+                      index <- c(index, parent - 1L)
+                    }
+                    level <- c(level, j)
+                    rank <- c(rank, taxa[j])
+            }
+            setTxtProgressBar(pBar, i/length(ranks))
+}
+groups <- gsub("^[ ]+", "", groups)
+groups <- gsub("[ ]+$", "", groups)
+taxid <- paste(0:(length(index) - 1L), groups, index, level, rank, sep="*")
+head(taxid, n=10)
+writeLines(taxid, con=paste0(working_dir, "ehomd_ref_seq_decipher_taxid.txt"))
+
+```
+
+```{r}
+seqs_path <- paste0(working_dir, "required_files/ehomd_ref_seq_decipher.fasta")
+seqs <- readDNAStringSet(seqs_path)
+rank_path <- paste0(working_dir, "ehomd_ref_seq_decipher_taxid.txt")
+taxid <- read.table(rank_path,header=FALSE,
+            col.names=c('Index', 'Name', 'Parent', 'Level', 'Rank'),
+            sep="*", # asterisks delimited
+            quote="", # preserve quotes
+            stringsAsFactors=FALSE)
+#taxid <- NULL
+seqs <- OrientNucleotides(seqs)
+groups <- names(seqs)
+groups <- gsub("(.*)(Root;)", "\\2", groups)
+groupCounts <- table(groups)
+u_groups <- names(groupCounts)
+length(u_groups)
+```
+
+```{r}
+maxGroupSize <- 10
+remove <- logical(length(seqs))
+for (i in which(groupCounts > maxGroupSize)) {
+            index <- which(groups==u_groups[i])
+            keep <- sample(length(index),
+                    maxGroupSize)
+            remove[index[-keep]] <- TRUE
+}
+sum(remove)
+```
+
+```{r}
+maxIterations <- 3 # must be >= 1
+allowGroupRemoval <- FALSE
+probSeqsPrev <- integer()
+for (i in seq_len(maxIterations)) {
+            cat("Training iteration: ", i, "\n", sep="")
+            # train the classifier
+            trainingSet <- LearnTaxa(seqs[!remove],
+                    names(seqs)[!remove],
+                    taxid)
+            # look for problem sequences
+            probSeqs <- trainingSet$problemSequences$Index
+            if (length(probSeqs)==0) {
+                    cat("No problem sequences remaining.\n")
+                    break
+            } else if (length(probSeqs)==length(probSeqsPrev) &&
+                    all(probSeqsPrev==probSeqs)) {
+                    cat("Iterations converged.\n")
+                    break
+            }
+            if (i==maxIterations)
+                    break
+            probSeqsPrev <- probSeqs
+            # remove any problem sequences
+            index <- which(!remove)[probSeqs]
+            remove[index] <- TRUE # remove all problem sequences
+            if (!allowGroupRemoval) {
+                    # replace any removed groups
+                    missing <- !(u_groups %in% groups[!remove])
+                    missing <- u_groups[missing]
+                    if (length(missing) > 0) {
+                            index <- index[groups[index] %in% missing]
+                            remove[index] <- FALSE # don't remove
+                    }
+            }
+}
+sum(remove)
+length(probSeqs)
+```
+
+
+```{r}
+#save it 
+saveRDS(trainingSet, file= paste0(working_dir, "eHOMD_decipher_training_set.rds"))
+```
+
+## merge zymo dada2 asv runs
+
+```{r}
+
+read_fasta <- function(fasta_file_path) {
+  # read in the FASTA file
+  fasta_lines <- readLines(fasta_file_path)
+  
+  # initialize an empty dictionary
+  fasta_dict <- list()
+  
+  # loop over the lines of the file
+  for (i in 1:length(fasta_lines)) {
+    line <- fasta_lines[i]
+    
+    # if the line starts with ">" it is a header line
+    if (substr(line, 1, 1) == ">") {
+      # get the header by removing the ">" character
+      if (nchar(line) > 1) {
+        header <- strsplit(sub(".", "", line), " ")[[1]][1]
+      } else {
+        header <- ""
+      }
+      
+      # initialize an empty string for the sequence
+      sequence <- ""
+    } else {
+      # add the sequence to the existing string
+      sequence <- paste(sequence, line, sep = "")
+      
+      # if this is the last line of the file or the next line is a header line
+      if (i == length(fasta_lines) || substr(fasta_lines[i + 1], 1, 1) == ">") {
+        # add the header and sequence to the dictionary
+        fasta_dict[[header]] <- sequence
+      }
+    }
+  }
+  
+  # return the dictionary
+  return(fasta_dict)
+}
+
+#read in csv and seq dict to output matrix
+read_named_int_matrix <- function(file_path, fasta_dict) {
+  # Read in the CSV file
+  data <- read.csv(file_path, header = TRUE, row.names = 1)
+  colnames(data) <- sapply(names(data), function(x) fasta_dict[x])
+
+  # Convert the data frame to a matrix with named rows and columns
+  mat <- as.matrix(data)
+  rownames(mat) <- rownames(data)
+  colnames(mat) <- colnames(data)
+
+  return(mat)
+}
+```
+
+```{r}
+run_1_fasta_dict <- read_fasta(paste0(working_dir, "required_files/round1_asv.seqs.fna")) 
+run_1_asv_table <- read_named_int_matrix(paste0(working_dir, "required_files/round1_ASV_Abundance_Table.csv"), run_1_fasta_dict)
+
+run_2_fasta_dict <- read_fasta(paste0(working_dir, "required_files/round2_asv.seqs.fna"))
+run_2_asv_table <- read_named_int_matrix(paste0(working_dir, "required_files/round2_ASV_Abundance_Table.csv"), run_2_fasta_dict)
+
+run_3_fasta_dict <- read_fasta(paste0(working_dir, "required_files/round3_asv.seqs.fna"))
+run_3_asv_table <- read_named_int_matrix(paste0(working_dir, "required_files/round3_ASV_Abundance_Table.csv"), run_3_fasta_dict)
+
+run_4_fasta_dict <- read_fasta(paste0(working_dir, "required_files/round4_asv.seqs.fna"))
+run_4_asv_table <- read_named_int_matrix(paste0(working_dir, "required_files/round4_ASV_Abundance_Table.csv"), run_4_fasta_dict)
+
+run_5_fasta_dict <- read_fasta(paste0(working_dir, "required_files/round5_asv.seqs.fna"))
+run_5_asv_table <- read_named_int_matrix(paste0(working_dir, "required_files/round5_ASV_Abundance_Table.csv"), run_5_fasta_dict)
+```
+
+
+```{r}
+#merge the tables together
+merged_seq_table <- mergeSequenceTables(tables = list(run_1_asv_table, run_2_asv_table, run_3_asv_table, run_4_asv_table, run_5_asv_table))
+```
+
+```{r}
+#saving the asv counts to a csv 
+naming_dict <- setNames(colnames(merged_seq_table), sprintf("ASV_%04d",1:ncol(merged_seq_table)))
+write.table(paste(paste0(">", names(naming_dict)), naming_dict, sep = "\n"), quote = F, col.names = F, row.names = F,
+            file = paste0(working_dir, "all_runs_combined_asv_references.fasta"))
+
+
+asv_counts <- merged_seq_table
+colnames(asv_counts) <- names(naming_dict)
+
+write.table(asv_counts, quote = F, sep = "\t", col.names = NA, row.names = T,
+            file=paste0(working_dir, "all_runs_final_asv_counts.tsv"))
+```
+
+## assign taxonomy using eHOMD
+
+```{r}
+#load decipher classifier
+trainingSet <- readRDS(file = paste0(working_dir, "eHOMD_decipher_training_set.rds"))
+
+dna <- DNAStringSet(getSequences(merged_seq_table))
+ids <- IdTaxa(dna, trainingSet, strand="both", processors=NULL, verbose=FALSE)
+ranks <- c("kingdom", "phylum", "class", "order", "family", "genus", "species")
+taxid <- t(sapply(ids, function(x) {
+        m <- match(ranks, x$rank)
+        taxa <- x$taxon[m]
+        taxa[startsWith(taxa, "unclassified_")] <- NA
+        taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(merged_seq_table)
+
+taxa <- taxid
+```
+
+```{r}
+#save ASV to taxa assignments as a table
+write.csv(taxa, file = paste0(output_folder, "ASV_Taxa_assignments.csv"), quote = F, row.names = T)
+```
+
+## phyloseq
+
+```{r}
+theme_set(theme_bw())
+
+sample_metadata_df = read.csv(paste0(working_dir, "required_files/sample_group_metadata.csv"), header=TRUE, row.names = 1)
+sample_metadata_df$group <- paste0(sample_metadata_df$Saliva_nares, "_", sample_metadata_df$condition)
+sample_metadata_df$sample_name <- row.names(sample_metadata_df)
+```
+
+```{r}
+ps <- phyloseq(otu_table(merged_seq_table, taxa_are_rows=FALSE), 
+               sample_data(sample_metadata_df), 
+               tax_table(taxa))
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+```
+
+```{r}
+#am I saving the unclassified ASVs?
+remove_unclassified_ASVs = FALSE
+
+```
+
+Save the phylum level relative abundance
+
+```{r}
+#save phylum table
+phylum_abun_table <- ps %>% tax_glom(taxrank = "phylum", NArm=remove_unclassified_ASVs) %>% transform_sample_counts(function(x) {x/sum(x)}) %>% psmelt() %>% select(OTU, phylum, Sample, Abundance) %>% spread(Sample, Abundance)
+
+#fill na phylum as "unknown"
+phylum_abun_table[is.na(phylum_abun_table)] <- "unclassified"
+
+#sum the NA rows
+phylum_abun_table <- phylum_abun_table %>%
+  group_by(phylum) %>%
+  summarize(across(where(is.numeric), sum))
+
+#save the table
+write.table(phylum_abun_table, file = paste0(output_folder, "relative_abundance.phylum.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+```
+
+Save the genus level relative abundance
+```{r}
+#save genera table
+genera_abun_table <- ps %>% tax_glom(taxrank = "genus", NArm=remove_unclassified_ASVs) %>% transform_sample_counts(function(x) {x/sum(x)}) %>% psmelt() %>% select(OTU, genus, Sample, Abundance) %>% spread(Sample, Abundance)
+
+#fill na genera as "unknown"
+genera_abun_table[is.na(genera_abun_table)] <- "unclassified"
+
+#sum the NA rows
+genera_abun_table <- genera_abun_table %>%
+  group_by(genus) %>%
+  summarize(across(where(is.numeric), sum))
+
+#save the table
+write.table(genera_abun_table, file = paste0(output_folder, "relative_abundance.genus.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+```
+
+Save the species level relative abundance
+```{r}
+eHOMD_metadata_table_location = paste0(working_dir, "required_files/HOMD_taxon_table.tsv")
+```
+
+
+```{r}
+#save species table
+species_abun_table <- ps %>% tax_glom(taxrank = "species", NArm=remove_unclassified_ASVs) %>% transform_sample_counts(function(x) {x/sum(x)}) %>% psmelt() %>% select(OTU, species, Sample, Abundance) %>% spread(Sample, Abundance)
+
+#fill na species as "unclassified"
+species_abun_table[is.na(species_abun_table)] <- "unclassified"
+
+#sum the NA rows
+species_abun_table <- species_abun_table %>%
+  group_by(species) %>%
+  summarize(across(where(is.numeric), sum))
+
+
+#read_in_ehomd_metadata to pair hmt number with genus and species
+homd_tax_metadata <- read.delim(eHOMD_metadata_table_location, sep="\t", header=TRUE, fill=T)
+homd_tax_metadata$genus_species_hmt = paste(homd_tax_metadata$Genus, homd_tax_metadata$Species, homd_tax_metadata$HMT_ID, sep="_")
+homd_tax_metadata_sub <- homd_tax_metadata[c("HMT_ID", "genus_species_hmt")]
+homd_tax_metadata_sub$HMT_ID <- as.numeric(as.character(homd_tax_metadata_sub$HMT_ID))
+
+#merge with the species abundance table
+species_abun_table = data.frame(species_abun_table)
+species_abun_table[c('species', 'HMT_ID')] <- str_split_fixed(species_abun_table$species, '-', 2)
+species_abun_table$HMT_ID <- as.numeric(as.character(species_abun_table$HMT_ID))
+species_abun_table <- merge(species_abun_table, homd_tax_metadata_sub, by="HMT_ID", all.x=T)
+species_abun_table[is.na(species_abun_table)] <- "unclassified"
+
+rownames(species_abun_table) <- species_abun_table$genus_species_hmt
+species_abun_table <- subset(species_abun_table, select = -c(HMT_ID, species, genus_species_hmt))
+species_abun_table <- tibble::rownames_to_column(species_abun_table, "genus_species_hmt")
+
+write.table(species_abun_table, file = paste0(output_folder, "relative_abundance.species.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+```
+
+## Bar Chart
+
+create the bar charts:  
+  
+```{r}
+#create folder for bar charts
+dir.create(file.path(output_folder, "barcharts"), showWarnings = FALSE)
+barcharts_folder_location = paste0(output_folder, "barcharts/")
+
+#figure parameters
+barchart_width = 50
+barchart_height = 4
+```
+  
+  
+a function to generate bar charts at a particular taxonomic level. It only colors the top 10 most abundant clades at a particular taxonomic level while grouping all other clades into a category called "other".
+```{r}
+generate_bar_plots <- function(abundance_table, taxonomic_level) {
+  # Drop the first column (genera/phylum/species) from the abundance table
+  abundance_table <- data.frame(abundance_table)
+  rownames(abundance_table) <- abundance_table[,1]
+  abundance_table[, 1] <- NULL
+
+  # Calculate the total percent abundance at the specified taxonomic level
+  abundance_sum <- rowSums(abundance_table)
+
+  # Sort the taxonomic entities based on their total percent abundance
+  sorted_entities <- names(sort(abundance_sum, decreasing = TRUE))
+
+  # Select the top 10 most abundant taxonomic entities
+  top_entities <- sorted_entities[1:10]
+
+  # Include "unknown" if it is not already in the top entities list
+  if (!("unclassified" %in% top_entities)) {
+    top_entities <- c(top_entities, "unclassified")
+  }
+
+  # Filter out rows that are not in the top entities
+  other_entities <- !rownames(abundance_table) %in% top_entities
+  other_row <- colSums(abundance_table[other_entities, ])
+  top_entities_df <- abundance_table[top_entities, ]
+  top_entities_df <- rbind(top_entities_df, other_row)
+  rownames(top_entities_df)[nrow(top_entities_df)] <- "other"
+  top_entities_df$entity <- row.names(top_entities_df)
+
+  # Reshape the data into long format
+  df_long <- tidyr::pivot_longer(top_entities_df, cols = -entity, names_to = "sample_name", values_to = "percentage")
+  df_long <- merge(df_long, sample_metadata_df)
+  df_long <- df_long[order(df_long$group, df_long$Sample_num, -df_long$percentage), ]
+  rownames(df_long) <- 1:nrow(df_long)
+
+  # Set sample number as type character
+  df_long$sample_type_sample_num <- with(df_long, paste(group, Sample_num, sep = "_"))
+
+  # Define colors for "other" and "unclassified"
+  other_color <- "#B2BABB"
+  unclassified_color <- "#546E7A"
+  
+  #remove unknown from top entities for coloring purposes
+  top_entities <- top_entities[top_entities != "unclassified"]
+  
+  # Define colors for top entities using default palette
+  top_entities_colors <- c("#619ED6", "#6BA547", "#8E44AD", "#E48F1B", "#E64345", "#60CEED", "#9CF168", "#F7EA4A", "#FBC543", "#FFC9ED")
+  
+  # Create a stacked bar chart
+  p1 <- ggplot(df_long, aes(x = factor(Sample_num), y = percentage, fill = entity)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Samples", y = "Relative percentages", fill = "Entities") +
+    scale_fill_manual(values = c(setNames(top_entities_colors, top_entities), other = other_color, unclassified = unclassified_color)) +
+    facet_wrap(~group, scales = "free_x", nrow = 1) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+  # Save the plot as a PDF file
+  ggsave(
+    file.path(barcharts_folder_location, paste0(taxonomic_level, "_bar_plots.pdf")),
+    plot = p1,
+    device = NULL,
+    path = NULL,
+    scale = 1,
+    width = barchart_width,
+    height = barchart_height,
+    limitsize = FALSE
+  )
+}
+
+```
+
+generate the bar charts at the phylum, genus, and species level
+```{r}
+generate_bar_plots(phylum_abun_table, "phylum")
+generate_bar_plots(genera_abun_table, "genus")
+generate_bar_plots(species_abun_table, "species")
+
+```
+
+## Metacoder
+
+```{r}
+#convert phyloseq object to metacoder object
+obj <- parse_phyloseq(ps, class_regex = "(.*)", class_key = "taxon_name")
+```
+
+
+```{r}
+#remove low read counts
+obj$data$otu_table <- zero_low_counts(obj, data = "otu_table", min_count = 5)
+no_reads <- rowSums(obj$data$otu_table[, obj$data$sample_data$sample_name]) == 0
+sum(no_reads)
+obj <- filter_obs(obj, data = "otu_table", ! no_reads, drop_taxa = TRUE)
+
+```
+
+```{r}
+#account for uneven counts
+obj$data$otu_table <- calc_obs_props(obj, "otu_table", other_cols = TRUE)
+
+```
+
+
+```{r}
+#get per taxon information
+obj$data$tax_abund <- calc_taxon_abund(obj, "otu_table",
+                                       cols = obj$data$sample_data$sample_name)
+```
+
+```{r}
+#calculate occurrence per sample
+obj$data$tax_occ <- calc_n_samples(obj, "tax_abund", groups = obj$data$sample_data$group, cols = obj$data$sample_data$sample_name)
+
+```
+
+```{r}
+# Save taxon information
+write.table(obj$data$tax_data, file=paste0(output_folder, "metacoder_tax_data.tsv"), sep="\t", row.names = FALSE)
+```
+
+
+### alpha diversity
+  
+create alpha diversity folder
+```{r}
+#create folder for alpha diversity plots
+dir.create(file.path(output_folder, "alpha_diversity"), showWarnings = FALSE)
+alpha_diversity_folder_location = paste0(output_folder, "alpha_diversity/")
+
+alpha_diversity_width = 4
+alpha_diversity_height = 5
+```
+
+## alpha diversity for starved raw samples
+
+```{r}
+# Specify the desired groups in the desired order
+desired_groups <- c("Nares_Raw_sample", "Nares_shi_media_Pre_starvation", "Nares_shi_media_Post_starvation",
+                    "Saliva_Raw_sample", "Saliva_shi_media_Pre_starvation", "Saliva_shi_media_Post_starvation")
+
+# Filter data for the desired groups
+filtered_data <- obj$data$sample_data[obj$data$sample_data$group %in% desired_groups, ]
+
+alpha_diversity_metrics <- c("invsimpson", "shannon", "simpson")
+
+for (alpha_metric in alpha_diversity_metrics) {
+  
+  # Alpha diversity
+  obj$data$sample_data$alpha_diversity <- diversity(obj$data$otu_table[, obj$data$sample_data$sample_name], index = alpha_metric, MARGIN = 2)
+  
+  # Filtered alpha diversity data
+  filtered_alpha_diversity <- obj$data$sample_data[obj$data$sample_data$group %in% desired_groups, ]
+  
+  # Reorder the factor levels based on desired_groups
+  filtered_alpha_diversity$group <- factor(filtered_alpha_diversity$group, levels = desired_groups)
+  
+  # Anova statistical significance
+  anova_result <- aov(filtered_alpha_diversity$alpha_diversity ~ filtered_alpha_diversity$group)
+  summary(anova_result)
+  tukey_result <- HSD.test(anova_result, "filtered_alpha_diversity$group", group = TRUE)
+
+  group_data <- tukey_result$groups[rownames(tukey_result$groups),]
+  
+  # Plot the figure
+  ggplot(filtered_alpha_diversity, aes(x = factor(group, levels = desired_groups), y = alpha_diversity)) +
+    geom_text(data = data.frame(), aes(x = rownames(group_data), y = max(filtered_alpha_diversity$alpha_diversity) + .1, label = group_data$groups), col = 'black', size = 5) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.1, color = "#B0BEC5") + 
+    geom_dotplot(binaxis = 'y', stackdir = 'center', dotsize = 0.3) +
+    xlab("Sample Type") +
+    ylab(paste0(alpha_metric, " Index")) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    scale_x_discrete(limits = desired_groups)
+  
+  # Save the figure
+  ggsave(
+    paste0(alpha_diversity_folder_location, alpha_metric, "_alpha_diversity_metacoder_raw_pre_post.pdf"),
+    plot = last_plot(),
+    device = NULL,
+    path = NULL,
+    scale = 1,
+    width = alpha_diversity_width,
+    height = alpha_diversity_height,
+    limitsize = FALSE
+  )
+}
+```
+## alpha diversity for spiked samples
+
+```{r}
+# Specify the desired groups in the desired order
+desired_groups <- c("Nares_nutrient_poor_pre_starvation_spiked", "Nares_nutrient_poor_post_starvation_spiked", "Nares_nutrient_rich_post_starvation_spiked",
+                    "Saliva_nutrient_poor_pre_starvation_spiked", "Saliva_nutrient_poor_post_starvation_spiked", "Saliva_nutrient_rich_post_starvation_spiked")
+
+# Filter data for the desired groups
+filtered_data <- obj$data$sample_data[obj$data$sample_data$group %in% desired_groups, ]
+
+alpha_diversity_metrics <- c("invsimpson", "shannon", "simpson")
+
+for (alpha_metric in alpha_diversity_metrics) {
+  
+  # Alpha diversity
+  obj$data$sample_data$alpha_diversity <- diversity(obj$data$otu_table[, obj$data$sample_data$sample_name], index = alpha_metric, MARGIN = 2)
+  
+  # Filtered alpha diversity data
+  filtered_alpha_diversity <- obj$data$sample_data[obj$data$sample_data$group %in% desired_groups, ]
+  
+  # Reorder the factor levels based on desired_groups
+  filtered_alpha_diversity$group <- factor(filtered_alpha_diversity$group, levels = desired_groups)
+  
+  # Anova statistical significance
+  anova_result <- aov(filtered_alpha_diversity$alpha_diversity ~ filtered_alpha_diversity$group)
+  summary(anova_result)
+  tukey_result <- HSD.test(anova_result, "filtered_alpha_diversity$group", group = TRUE)
+
+  group_data <- tukey_result$groups[rownames(tukey_result$groups),]
+  
+  # Plot the figure
+  ggplot(filtered_alpha_diversity, aes(x = factor(group, levels = desired_groups), y = alpha_diversity)) +
+    geom_text(data = data.frame(), aes(x = rownames(group_data), y = max(filtered_alpha_diversity$alpha_diversity) + .1, label = group_data$groups), col = 'black', size = 5) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.1, color = "#B0BEC5") + 
+    geom_dotplot(binaxis = 'y', stackdir = 'center', dotsize = 0.3) +
+    xlab("Sample Type") +
+    ylab(paste0(alpha_metric, " Index")) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    scale_x_discrete(limits = desired_groups)
+  
+  # Save the figure
+  ggsave(
+    paste0(alpha_diversity_folder_location, alpha_metric, "_alpha_diversity_metacoder_rich_poor_spiked.pdf"),
+    plot = last_plot(),
+    device = NULL,
+    path = NULL,
+    scale = 1,
+    width = alpha_diversity_width,
+    height = alpha_diversity_height,
+    limitsize = FALSE
+  )
+}
+```
+
+
+
+
+#beta diversity
+  
+Beta diversity PCoA plot
+```{r}
+beta_diversity_width = 12
+beta_diversity_height = 4
+```
+
+```{r}
+ps_ord <- ordinate(ps, method = "PCoA", distance = "bray")
+
+# Filter samples based on the specified groups
+desired_groups <- c("Nares_Raw_sample", "Nares_shi_media_Pre_starvation", "Nares_shi_media_Post_starvation",
+                    "Saliva_Raw_sample", "Saliva_shi_media_Pre_starvation", "Saliva_shi_media_Post_starvation")
+
+filtered_samples <- subset_samples(ps, group %in% desired_groups)
+
+# Calculate PCoA using the filtered samples
+ps_ord <- ordinate(filtered_samples, method = "PCoA", distance = "bray")
+
+color_dict <- c("Saliva_Raw_sample" = "#1565C0",
+                "Nares_Raw_sample" = "#FF5722",
+                "Saliva_shi_media_Pre_starvation" = "#4DD0E1",
+                "Nares_shi_media_Pre_starvation" = "#FDD835",
+                "Saliva_shi_media_Post_starvation" = "#26A69A",
+                "Nares_shi_media_Post_starvation" = "#AB47BC")
+
+# Plot the filtered samples
+p <- plot_ordination(filtered_samples, ps_ord, type = "sample_name", color = "group") + theme_classic() + scale_color_manual(values = color_dict) + geom_point(alpha = 0.8, shape = 21, size = 2, color=NA, stroke=0.1)
+
+#p <- p + xlim(-0.42, -0.1) + ylim(-0.1, 0.1)
+
+
+# Save the plot
+ggsave(
+  file.path(output_folder, "beta_diversity_PCoA_plot.pdf"),
+  plot = p,
+  device = NULL,
+  path = NULL,
+  scale = 1,
+  width = beta_diversity_width,
+  height = beta_diversity_height,
+  limitsize = FALSE
+)
+```
+
+## Permanova
+
+```{r}
+print("Nares raw vs saliva raw")
+physeq.subs <- subset_samples(ps, group %in% c("Nares_Raw_sample", "Saliva_Raw_sample"))
+
+metadata <- as(sample_data(physeq.subs), "data.frame")
+
+adonis2(distance(physeq.subs, method="bray") ~ group,
+       data = metadata)
+
+physeq.subs <- subset_samples(ps, group %in% c("Nares_shi_media_Pre_starvation", "Nares_shi_media_Post_starvation"))
+
+metadata <- as(sample_data(physeq.subs), "data.frame")
+
+adonis2(distance(physeq.subs, method="bray") ~ group,
+       data = metadata)
+```
+
+
+
+## heat trees
+
+```{r}
+#create heat trees folder
+dir.create(file.path(output_folder, "heat_trees"), showWarnings = FALSE)
+
+#subset to Nares_Raw_sample hour and Nares_shi_media_Post_starvation
+
+nares_raw_post_taxa <- subset(obj$data$tax_occ, Nares_Raw_sample + Nares_shi_media_Post_starvation > 0)$taxon_id
+
+
+obj_nares_raw_post <- metacoder::filter_taxa(obj, nares_raw_post_taxa)
+
+obj_nares_raw_post$data$sample_data_nares_raw_nares_post <- obj_nares_raw_post$data$sample_data[obj_nares_raw_post$data$sample_data$group %in% c("Nares_Raw_sample", "Nares_shi_media_Post_starvation"),]
+
+obj_nares_raw_post$data$diff_table <- compare_groups(obj_nares_raw_post, dataset = "tax_abund",
+                                      cols = obj_nares_raw_post$data$sample_data_nares_raw_nares_post$sample_id, # What columns of sample data to use
+                                      groups = obj_nares_raw_post$data$sample_data_nares_raw_nares_post$group) # What category each sample is assigned to
+
+
+#statistical significance
+obj_nares_raw_post$data$diff_table$wilcox_p_value <- p.adjust(obj_nares_raw_post$data$diff_table$wilcox_p_value, method = "fdr")
+write.table(obj_nares_raw_post$data$diff_table, file=paste0(output_folder, "heat_trees/nares_raw_post_differential_heat_tree_table.tsv"), sep="\t", row.names = FALSE)
+
+obj_nares_raw_post$data$diff_table$log2_median_ratio[obj_nares_raw_post$data$diff_table$wilcox_p_value > 0.05] <- 0
+
+print(obj_nares_raw_post$data$diff_table$treatment_1[1])
+print(obj_nares_raw_post$data$diff_table$treatment_2[1])
+
+
+set.seed(1)
+heat_tree(obj_nares_raw_post,
+          node_label = taxon_names,
+          node_size = n_obs, # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+          node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+          node_color_interval = c(-max(abs(range(obj_nares_raw_post$data$diff_table$log2_median_ratio, finite = TRUE))), max(abs(range(obj_nares_raw_post$data$diff_table$log2_median_ratio, finite = TRUE)))), # The range of `log2_median_ratio` to display
+          node_color_range = c("#FF5722", "#CCD1D1", "#1565C0"), # The color palette used
+          node_size_axis_label = "ASV count",
+          node_color_axis_label = "Log 2 ratio of median proportions",
+          layout = "davidson-harel", # The primary layout algorithm
+          initial_layout = "reingold-tilford",
+          output_file = paste0(output_folder, "heat_trees/nares_raw_post_differential_heat_tree.svg")) # The layout algorithm that initializes node locations
+```
+
+```{r}
+#subset to Saliva_Raw_sample hour and Saliva_shi_media_Post_starvation
+
+saliva_raw_post_taxa <- subset(obj$data$tax_occ, Saliva_Raw_sample + Saliva_shi_media_Post_starvation > 0)$taxon_id
+
+
+obj_saliva_raw_post <- metacoder::filter_taxa(obj, saliva_raw_post_taxa)
+
+obj_saliva_raw_post$data$sample_data_saliva_raw_post <- obj_saliva_raw_post$data$sample_data[obj_saliva_raw_post$data$sample_data$group %in% c("Saliva_Raw_sample", "Saliva_shi_media_Post_starvation"),]
+
+obj_saliva_raw_post$data$diff_table <- compare_groups(obj_saliva_raw_post, dataset = "tax_abund",
+                                      cols = obj_saliva_raw_post$data$sample_data_saliva_raw_post$sample_id, # What columns of sample data to use
+                                      groups = obj_saliva_raw_post$data$sample_data_saliva_raw_post$group) # What category each sample is assigned to
+
+
+#statiscital significance
+obj_saliva_raw_post$data$diff_table$wilcox_p_value <- p.adjust(obj_saliva_raw_post$data$diff_table$wilcox_p_value, method = "fdr")
+write.table(obj_saliva_raw_post$data$diff_table, file=paste0(output_folder, "heat_trees/saliva_raw_post_differential_heat_tree_table.tsv", sep="\t", row.names = FALSE))
+
+obj_saliva_raw_post$data$diff_table$log2_median_ratio[obj_saliva_raw_post$data$diff_table$wilcox_p_value > 0.05] <- 0
+
+print(obj_saliva_raw_post$data$diff_table$treatment_1[1])
+print(obj_saliva_raw_post$data$diff_table$treatment_2[1])
+
+
+set.seed(1)
+heat_tree(obj_saliva_raw_post,
+          node_label = taxon_names,
+          node_size = n_obs, # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+          node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+          node_color_interval = c(-max(abs(range(obj_saliva_raw_post$data$diff_table$log2_median_ratio, finite = TRUE))), max(abs(range(obj_saliva_raw_post$data$diff_table$log2_median_ratio, finite = TRUE)))), # The range of `log2_median_ratio` to display
+          node_color_range = c("#FF5722", "#CCD1D1", "#1565C0"), # The color palette used
+          node_size_axis_label = "ASV count",
+          node_color_axis_label = "Log 2 ratio of median proportions",
+          layout = "davidson-harel", # The primary layout algorithm
+          initial_layout = "reingold-tilford",
+          output_file = paste0(output_folder, "heat_trees/saliva_raw_post_differential_heat_tree.svg")) # The layout algorithm that initializes node locations
+```
+
+
+
+
+
+
+
